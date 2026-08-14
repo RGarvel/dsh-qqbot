@@ -1,6 +1,8 @@
 # @tencent-connect/dsh-qqbot
 
-基于 [deepseek-harness](../deepseek-harness) (dsh) 的 QQ Bot IM 插件，将 QQ 消息平台作为 dsh agent 的前端协议驱动。
+基于 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) (dsh) 的 QQ Bot IM 插件，将 QQ 消息平台作为 dsh agent 的前端协议驱动。
+
+中文 | [English](./README_EN.md)
 
 ## 架构
 
@@ -13,45 +15,19 @@ QQ 用户 → QQ WebSocket → dsh-im-qqbot → ctx.agents → dsh agent loop �
 
 ## 安装
 
-### 方式一：一键安装脚本
-
-```bash
-# 安装默认包最新版本
-sh install.sh
-
-# 指定版本
-sh install.sh --version 0.2.0
-
-# 指定包名
-sh install.sh --pkg @myorg/my-qqbot-plugin
-
-# 指定包名 + 版本
-sh install.sh --pkg @myorg/my-qqbot-plugin --version 1.0.0
-
-# 指定 npm registry
-sh install.sh --registry https://registry.npmmirror.com
-
-# 查看帮助
-sh install.sh --help
-```
-
-脚本自动完成 dsh/pnpm 预检 + profile 初始化 + 插件注册。
-
-### 方式二：手动执行
+### 方式一：手动执行
 
 ```bash
 # 安装到 profile
 dsh plugin --profile qqbot add @tencent-connect/dsh-qqbot
 
-# 配置环境变量
-export QQBOT_APPID="你的AppID"
-export QQBOT_SECRET="你的AppSecret"
-
 # 启动
 dsh --profile qqbot
 ```
 
-### 方式三：本地路径安装
+首次启动时，插件检测到凭据未配置会自动进入扫码引导：终端输出二维码 → 手机 QQ 扫码绑定 → 凭据自动保存到 profile，后续启动无需再次扫码。
+
+### 方式二：本地路径安装
 
 ```bash
 # 构建
@@ -95,36 +71,44 @@ pnpm dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 
 | 命令 | 说明 |
 |------|------|
-| `/reset` | 重置当前会话（清除上下文） |
-| `/clear` | 同 `/reset` |
+| `/bot-reset` | 重置当前会话（清除上下文） |
+| `/bot-model` | 查看或切换模型 |
+| `/bot-status` | 查看当前会话状态 |
+| `/bot-help` | 查看所有指令 |
 
 ## 核心模块
 
 ```
 src/
-├── index.ts              # Cordis 插件入口（async apply）
-├── config.ts             # 配置 Schema
-├── session-manager.ts    # QQ peer → Agent 映射（get → resume → create）
-├── inbound.ts            # QQ 入站消息 → agent.followup()
-├── outbound.ts           # session/event → QQ sendMarkdown
-├── mention.ts            # @mention 检测/清理
-├── chunker.ts            # Markdown 文本切分（代码块/表格感知）
-└── types.ts              # 内部类型定义
+├── index.ts                    # Cordis 插件入口（async apply）
+├── config.ts                   # 配置 Schema
+├── types.ts                    # 全局类型定义
+├── setup.ts                    # 凭据绑定（扫码）
+├── transport/                  # 传输层
+│   ├── inbound.ts              # QQ 入站消息 → agent.followup()
+│   ├── outbound.ts             # session/event → QQ sendMarkdown
+│   ├── outbound-buffer.ts      # 流式缓冲
+│   └── chunker.ts              # Markdown 文本切分
+├── session/                    # 会话管理层
+│   ├── session-manager.ts      # QQ peer → Agent 映射
+│   └── idle-evictor.ts         # 闲置回收
+├── model/                      # 模型路由层
+│   ├── model-resolver.ts       # 路由解析
+│   ├── prefs-store.ts          # per-peer 偏好持久化
+│   └── settings-reader.ts      # settings.yaml 只读
+├── shared/                     # 共享工具
+│   ├── utils.ts                # 通用函数
+│   ├── scope.ts                # scope/peer 提取
+│   └── send-helper.ts          # 分块发送
+├── commands/                   # 斜杠命令
+└── typings/                    # 外部模块声明
 ```
 
 ## 会话路由
 
-sessionKey 格式: `qqbot:${appId}:${kind}:${peerId}`
+sessionKey: `qqbot:${appId}:${scope}:${peerId}`，由 SHA-256 确定性派生 SessionId，重启后可恢复。
 
-- c2c (私聊): `qqbot:102901613:c2c:B9CE1DEEC46B...`
-- group (群聊): `qqbot:102901613:group:16FA861B01EE...`
-
-SessionId 由 sessionKey 确定性派生（SHA-256），保证同一用户/群的消息始终路由到同一 agent，重启后可恢复会话。
-
-会话解析策略（三级降级）：
-1. **进程内复用** — `agents.get(sessionId)`
-2. **持久化恢复** — `agents.resume({ resumeSessionId, setup })`
-3. **全新创建** — `agents.create({ sessionId, meta, setup })`
+解析策略：进程内复用 → 持久化恢复 → 全新创建。
 
 ## 设计原则
 
@@ -153,46 +137,6 @@ export QQBOT_APPID="xxx" QQBOT_SECRET="xxx"
 pnpm dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 ```
 
-### 断点调试
+## License
 
-```bash
-node --inspect ./node_modules/.bin/dsh --profile headless \
-  --patch /path/to/dsh-qqbot/cordis.dev.yml
-```
-
-### VS Code launch.json
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "dsh + qqbot (patch)",
-      "type": "node",
-      "request": "launch",
-      "cwd": "/path/to/deepseek-harness",
-      "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["dsh", "web", "--patch", "/path/to/dsh-qqbot/cordis.dev.yml"],
-      "env": {
-        "QQBOT_APPID": "你的AppID",
-        "QQBOT_SECRET": "你的AppSecret",
-        "DEEPSEEK_API_KEY": "sk-xxx"
-      },
-      "console": "integratedTerminal"
-    }
-  ]
-}
-```
-
-## 发布
-
-```bash
-pnpm build
-npm publish --access public
-```
-
-安装后用户通过以下命令添加到 dsh：
-
-```bash
-dsh plugin --profile qqbot add @tencent-connect/dsh-qqbot
-```
+[MIT](./LICENSE)

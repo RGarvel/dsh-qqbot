@@ -67,6 +67,8 @@ export interface ImQQBotConfig {
   sessionIdleTimeout: number;
   /** 是否把 Web 端发起的回合镜像推送到 QQ（用户消息带标记 + 机器人回复） */
   mirrorWeb: boolean;
+  /** 助手消息尾部出现编号选项时，自动追加可点击的快捷按钮（点击等同回复编号） */
+  quickReplyButtons: boolean;
   /** 并发队列最大长度 */
   maxQueue: number;
   /** 处理超时(ms)，超时中断当前 LLM 调用 */
@@ -99,6 +101,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
   sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)'),
   mirrorWeb: Schema.boolean().default(true).description('Web端发起的回合镜像推送到QQ（用户消息带标记+机器人回复）'),
+  quickReplyButtons: Schema.boolean().default(true).description('助手消息尾部出现编号选项时自动追加可点击快捷按钮（点击等同回复编号）'),
   maxQueue: Schema.number().default(20).description('并发队列最大长度'),
   processingTimeoutMs: Schema.number().default(120000).description('处理超时(ms)'),
   historyLimit: Schema.number().default(10).description('群历史缓冲条数'),

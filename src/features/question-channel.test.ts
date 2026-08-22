@@ -224,13 +224,14 @@ describe('QuestionChannel.askViaQQ', () => {
 });
 
 describe('QuestionChannel.handleInteraction', () => {
-  function makeEvent(data: string | undefined, peer: { user?: string; group?: string }): InteractionEvent {
+  function makeEvent(data: string | undefined, peer: { user?: string; group?: string; member?: string }): InteractionEvent {
     return {
       id: 'i1',
       type: 1,
       version: 1,
       ...(peer.group ? { group_openid: peer.group } : {}),
       ...(peer.user ? { user_openid: peer.user } : {}),
+      ...(peer.member ? { group_member_openid: peer.member } : {}),
       data: { type: 1, resolved: { ...(data !== undefined ? { button_data: data } : {}) } },
     } as InteractionEvent;
   }
@@ -240,7 +241,7 @@ describe('QuestionChannel.handleInteraction', () => {
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
     const p = startAsk(ch, 'qqbot:app:c2c:U1', [q2()]);
     await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 1 }), { user: 'U1' }))).toBe(true);
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 1 }), { user: 'U1' }))).toMatchObject({ kind: 'answered' });
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
   });
 
@@ -249,7 +250,7 @@ describe('QuestionChannel.handleInteraction', () => {
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
     const p = startAsk(ch, 'qqbot:app:group:G1', [q2()], 'group');
     await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'someone', group: 'G1' }))).toBe(true);
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'someone', group: 'G1' }))).toMatchObject({ kind: 'answered' });
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
   });
 
@@ -259,7 +260,7 @@ describe('QuestionChannel.handleInteraction', () => {
     const long = '这是一个非常非常长的选项标签超过十八个字符的限制了吧';
     const p = startAsk(ch, 'qqbot:app:c2c:U7', [{ id: 'q', question: 't', options: [{ label: long }] }]);
     await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'U7' }))).toBe(true);
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'U7' }))).toMatchObject({ kind: 'answered' });
     expect(await p).toEqual({ answers: [{ id: 'q', selected: [long] }] });
   });
 
@@ -268,12 +269,55 @@ describe('QuestionChannel.handleInteraction', () => {
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
     const p = startAsk(ch, 'qqbot:app:c2c:U2', [q2()]);
     await sleep(20);
-    expect(ch.handleInteraction(makeEvent('not-json', { user: 'U2' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 9 }), { user: 'U2' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'nobody' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(undefined, { user: 'U2' }))).toBe(false);
+    expect(ch.handleInteraction(makeEvent('not-json', { user: 'U2' }))).toMatchObject({ kind: 'none' });
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 9 }), { user: 'U2' }))).toMatchObject({ kind: 'none' });
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'nobody' }))).toMatchObject({ kind: 'none' });
+    expect(ch.handleInteraction(makeEvent(undefined, { user: 'U2' }))).toMatchObject({ kind: 'none' });
     ch.tryAnswer('qqbot:app:c2c:U2', '1'); // 文本仍可作答
     await p;
+  });
+
+  it('quick reply: click on outbound-attached buttons resolves to a numbered user reply', () => {
+    const sent: SentMessage[] = [];
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
+    const key = 'qqbot:app:c2c:U3';
+    const text = '下一步你要哪个？\n1. 存档查阅就行，零风险不动活跃文件。\n2. 真正加载进活跃会话，需你确认时机。\n3. 改成时间交错合并再出一版。\n回 1 / 2 / 3 即可。';
+    const prep = ch.prepareQuickReply(key, text);
+    expect(prep?.labels).toHaveLength(3);
+    expect(prep?.keyboard.content.rows).toHaveLength(3);
+
+    const outcome = ch.handleInteraction(makeEvent(JSON.stringify({ i: 1 }), { user: 'U3' }));
+    expect(outcome).toMatchObject({ kind: 'quick-reply', scope: 'c2c', peerId: 'U3', senderId: 'U3', text: '2' });
+  });
+
+  it('quick reply: group click carries member openid as sender', () => {
+    const sent: SentMessage[] = [];
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
+    const key = 'qqbot:app:group:G2';
+    const prep = ch.prepareQuickReply(key, '选哪个？\n1. 甲方案，保守处理不动数据。\n2. 乙方案，直接替换需确认。');
+    expect(prep?.labels).toHaveLength(2);
+    const outcome = ch.handleInteraction(makeEvent(JSON.stringify({ i: 0 }), { user: 'U9', group: 'G2', member: 'M9' }));
+    expect(outcome).toMatchObject({ kind: 'quick-reply', scope: 'group', peerId: 'G2', senderId: 'M9', text: '1' });
+  });
+
+  it('quick reply: skipped while a formal question is pending; stale index ignored', async () => {
+    const sent: SentMessage[] = [];
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
+    const key = 'qqbot:app:c2c:U4';
+    const p = startAsk(ch, key, [q2()]);
+    await sleep(20);
+    expect(ch.prepareQuickReply(key, '选哪个？\n1. 甲方案，保守处理不动数据。\n2. 乙方案，直接替换需确认。')).toBeUndefined();
+    ch.tryAnswer(key, '1');
+    await p;
+    // 登记过快捷选项后，越界下标不命中
+    ch.prepareQuickReply('qqbot:app:c2c:U5', '选哪个？\n1. 甲方案，保守处理不动数据。\n2. 乙方案，直接替换需确认。');
+    expect(ch.handleInteraction(makeEvent(JSON.stringify({ i: 5 }), { user: 'U5' }))).toMatchObject({ kind: 'none' });
+  });
+
+  it('no options detected: prepareQuickReply returns undefined', () => {
+    const sent: SentMessage[] = [];
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
+    expect(ch.prepareQuickReply('qqbot:app:c2c:U6', '合并完成，一切正常，没有需要你选择的事项。')).toBeUndefined();
   });
 });
 
@@ -341,7 +385,7 @@ describe('QuestionChannel.install routing（双端投递）', () => {
     expect(ch.handleInteraction({
       id: 'i', type: 1, version: 1, user_openid: 'u9',
       data: { type: 1, resolved: { button_data: JSON.stringify({ i: 0 }) } },
-    } as InteractionEvent)).toBe(false);
+    } as InteractionEvent)).toMatchObject({ kind: 'none' });
   });
 
   it('web-originated turn: bridges via peer map and dual delivers', async () => {

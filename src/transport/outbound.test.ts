@@ -187,3 +187,105 @@ describe('OutboundRouter — Web 镜像与桥接', () => {
     expect(bot.sendWakeup).not.toHaveBeenCalled();
   });
 });
+
+describe('OutboundRouter — 快捷按钮（尾部编号选项兜底）', () => {
+  const flush = async () => {
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  };
+
+  const OPTIONS_TEXT = '下一步你要哪个？\n1. 合并文件存档就好，零风险不动活跃文件。\n2. 真正加载进活跃会话，需要你确认时机。\n3. 改成时间交错合并再出一版看看效果。\n回 1 / 2 / 3 即可。';
+
+  /** 带 sessionKey 的 manager（快捷按钮登记用规范键） */
+  function createKeyedManager(record?: SessionRecord): SessionManager {
+    return {
+      findBySessionId: vi.fn().mockReturnValue(record),
+      resolvePeer: vi.fn().mockReturnValue(undefined),
+      liveAgent: vi.fn().mockReturnValue(undefined),
+      sessionKey: (scope: ChatScope, peerId: string) => `qqbot:app:${scope}:${peerId}`,
+    } as unknown as SessionManager;
+  }
+
+  it('尾部编号选项：正文发送后追加快捷消息并附带键盘', async () => {
+    const record = createRecord(qqTarget, 0);
+    const bot = createBot();
+    const manager = createKeyedManager(record);
+    const { QuestionChannel } = await import('../features/question-channel.js');
+    const ch = new QuestionChannel(manager as never, { sendMarkdown: async () => undefined }, { requireMention: false }, createLogger());
+    const handler = createOutboundHandler(manager, bot, createConfig({ quickReplyButtons: true }), createLogger(), undefined, ch);
+
+    handler(session, assistantMessageEvent(OPTIONS_TEXT));
+    await flush();
+
+    const calls = (bot.sendMarkdown as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.length).toBe(2);
+    expect(calls[0]?.[1]).toContain('下一步你要哪个');
+    expect(calls[1]?.[1]).toContain('快速选择');
+    const kb = (calls[1]?.[2] as { keyboard?: { content?: { rows?: unknown[] } } } | undefined)?.keyboard;
+    expect(kb?.content?.rows).toHaveLength(3);
+  });
+
+  it('点击快捷按钮：解析为编号回复（quick-reply outcome）', async () => {
+    const record = createRecord(qqTarget, 0);
+    const bot = createBot();
+    const manager = createKeyedManager(record);
+    const { QuestionChannel } = await import('../features/question-channel.js');
+    const ch = new QuestionChannel(manager as never, { sendMarkdown: async () => undefined }, { requireMention: false }, createLogger());
+    const handler = createOutboundHandler(manager, bot, createConfig({ quickReplyButtons: true }), createLogger(), undefined, ch);
+
+    handler(session, assistantMessageEvent(OPTIONS_TEXT));
+    await flush();
+
+    const outcome = ch.handleInteraction({
+      id: 'i', type: 1, version: 1, user_openid: 'user1',
+      data: { type: 1, resolved: { button_data: JSON.stringify({ i: 1 }) } },
+    } as never);
+    expect(outcome).toMatchObject({ kind: 'quick-reply', peerId: 'user1', text: '2' });
+  });
+
+  it('普通消息：不追加快捷消息', async () => {
+    const record = createRecord(qqTarget, 0);
+    const bot = createBot();
+    const manager = createKeyedManager(record);
+    const { QuestionChannel } = await import('../features/question-channel.js');
+    const ch = new QuestionChannel(manager as never, { sendMarkdown: async () => undefined }, { requireMention: false }, createLogger());
+    const handler = createOutboundHandler(manager, bot, createConfig({ quickReplyButtons: true }), createLogger(), undefined, ch);
+
+    handler(session, assistantMessageEvent('合并完成，一切正常，无需你做任何选择。'));
+    await flush();
+
+    expect((bot.sendMarkdown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
+  it('quickReplyButtons 关闭：不追加快捷消息', async () => {
+    const record = createRecord(qqTarget, 0);
+    const bot = createBot();
+    const manager = createKeyedManager(record);
+    const { QuestionChannel } = await import('../features/question-channel.js');
+    const ch = new QuestionChannel(manager as never, { sendMarkdown: async () => undefined }, { requireMention: false }, createLogger());
+    const handler = createOutboundHandler(manager, bot, createConfig({ quickReplyButtons: false }), createLogger(), undefined, ch);
+
+    handler(session, assistantMessageEvent(OPTIONS_TEXT));
+    await flush();
+
+    expect((bot.sendMarkdown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
+  it('流式路径：chunk 缓冲经 assistant/message 收尾后同样追加快捷消息', async () => {
+    const record = createRecord(qqTarget, 0);
+    const bot = createBot();
+    const manager = createKeyedManager(record);
+    const { QuestionChannel } = await import('../features/question-channel.js');
+    const ch = new QuestionChannel(manager as never, { sendMarkdown: async () => undefined }, { requireMention: false }, createLogger());
+    const handler = createOutboundHandler(manager, bot, createConfig({ quickReplyButtons: true }), createLogger(), undefined, ch);
+
+    handler(session, { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: OPTIONS_TEXT } } });
+    handler(session, assistantMessageEvent(OPTIONS_TEXT));
+    await new Promise((r) => setTimeout(r, 30)); // 流式节流窗口
+    await flush();
+
+    const calls = (bot.sendMarkdown as ReturnType<typeof vi.fn>).mock.calls;
+    const quick = calls.find((c) => String(c[1]).includes('快速选择'));
+    expect(quick).toBeDefined();
+    expect((quick?.[2] as { keyboard?: unknown } | undefined)?.keyboard).toBeDefined();
+  });
+});

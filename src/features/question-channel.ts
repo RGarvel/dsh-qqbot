@@ -29,6 +29,7 @@
  */
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { ChatScope, Logger, ReplyTarget } from '../types.js';
+import { detectTrailingOptions } from './quick-reply.js';
 
 // ── user-questions 契约（结构化类型，避免硬依赖 dsh-user-questions） ──
 
@@ -104,6 +105,15 @@ interface PendingEntry {
   onAbort?: () => void;
 }
 
+/** 按钮点击的处理结果 */
+export type InteractionOutcome =
+  /** 命中待答问题，已作为答案提交 */
+  | { kind: 'answered' }
+  /** 命中出站层挂的快捷按钮：需把 text（选项编号）作为用户消息注入会话 */
+  | { kind: 'quick-reply'; scope: ChatScope; peerId: string; senderId: string; text: string }
+  /** 未命中任何待处理按钮 */
+  | { kind: 'none' };
+
 /** QQ 按钮 label 有长度限制，超长截断（正文保留完整文本） */
 const BUTTON_LABEL_MAX = 18;
 
@@ -112,24 +122,16 @@ function buttonLabel(text: string | undefined): string {
   return s.length > BUTTON_LABEL_MAX ? s.slice(0, BUTTON_LABEL_MAX - 1) + '…' : s;
 }
 
-/**
- * 为"单题、单选、带选项"的问题构建内联键盘；不适用时返回 undefined。
- * button_data 编码 `{"i":<选项下标>}`，由 handleInteraction 解码。
- */
-export function buildKeyboard(questions: readonly UserQuestion[]): InlineKeyboard | undefined {
-  if (questions.length !== 1) return undefined;
-  const q = questions[0];
-  if (!q) return undefined;
-  const opts = q.options ?? [];
-  if (opts.length === 0 || q.multiSelect) return undefined;
+/** 由选项标签构建内联键盘（一行一按钮）；button_data 编码 `{"i":<下标>}` */
+export function keyboardFromLabels(labels: readonly string[]): InlineKeyboard {
   return {
     content: {
-      rows: opts.map((o, i) => ({
+      rows: labels.map((label, i) => ({
         buttons: [{
           id: `q-opt-${i}`,
           render_data: {
-            label: buttonLabel(o.label),
-            visited_label: buttonLabel(o.label),
+            label: buttonLabel(label),
+            visited_label: buttonLabel(label),
             style: 1,
           },
           action: {
@@ -146,6 +148,19 @@ export function buildKeyboard(questions: readonly UserQuestion[]): InlineKeyboar
       })),
     },
   };
+}
+
+/**
+ * 为"单题、单选、带选项"的问题构建内联键盘；不适用时返回 undefined。
+ * button_data 编码 `{"i":<选项下标>}`，由 handleInteraction 解码。
+ */
+export function buildKeyboard(questions: readonly UserQuestion[]): InlineKeyboard | undefined {
+  if (questions.length !== 1) return undefined;
+  const q = questions[0];
+  if (!q) return undefined;
+  const opts = q.options ?? [];
+  if (opts.length === 0 || q.multiSelect) return undefined;
+  return keyboardFromLabels(opts.map((o) => o.label));
 }
 
 /** 把请求中的问题渲染成 QQ 文本 */
@@ -204,6 +219,8 @@ export function parseAnswers(questions: readonly UserQuestion[], text: string): 
 export class QuestionChannel {
   /** sessionKey → pending entry */
   private readonly pending = new Map<string, PendingEntry>();
+  /** sessionKey → 最近一条"尾部编号选项"消息的选项标签（快捷按钮点击解析用） */
+  private readonly quickReplies = new Map<string, string[]>();
   private uq: (UserQuestionsServiceLike & { __qqQuestionPatched?: boolean }) | undefined;
   private origAsk: ((request: UserQuestionRequest) => Promise<UserQuestionResult>) | undefined;
 
@@ -456,48 +473,80 @@ export class QuestionChannel {
   }
 
   /**
-   * 按钮点击回调：按事件来源定位会话，解码 button_data 提交答案。
-   * @returns true 表示点击命中了一个待答问题（调用方据此选择 ACK 结果）
+   * 出站快捷按钮：检测助手消息尾部的编号选项块，登记选项并返回键盘。
+   *
+   * 模型不一定总走 ask_user_question（被中断后继续推进时常直接列编号文本），
+   * 出站层对这类消息补挂按钮作确定性兜底：点击等同用户回复编号。
+   * 流式消息本身挂不了键盘，调用方把键盘放在随后的附加短消息上。
+   *
+   * @param key 规范会话键（`manager.sessionKey(scope, peerId)`；桥接记录的
+   *            `record.sessionKey` 是 `bridge:*`，不能直接用）
+   * @returns 键盘与选项标签；无选项块或该会话已有待答问题时返回 undefined
    */
-  handleInteraction(event: InteractionEvent): boolean {
+  prepareQuickReply(key: string, text: string): { keyboard: InlineKeyboard; labels: string[] } | undefined {
+    if (this.pending.has(key)) return undefined; // 正式提问在等待时不叠加快捷按钮
+    const labels = detectTrailingOptions(text);
+    if (labels === undefined) return undefined;
+    this.quickReplies.set(key, labels);
+    return { keyboard: keyboardFromLabels(labels), labels };
+  }
+
+  /**
+   * 按钮点击回调：按事件来源定位会话，解码 button_data——
+   * 命中待答问题则提交答案；否则尝试快捷按钮（出站层登记的编号选项）。
+   */
+  handleInteraction(event: InteractionEvent): InteractionOutcome {
     const raw = event?.data?.resolved?.button_data;
     if (typeof raw !== 'string' || raw.length === 0) {
       this.logger.warn('im-qqbot: interaction without button_data ignored');
-      return false;
+      return { kind: 'none' };
     }
     const peerId = event.group_openid ?? event.user_openid;
     if (!peerId) {
       this.logger.warn('im-qqbot: interaction without peer openid ignored');
-      return false;
+      return { kind: 'none' };
     }
     const scope: ChatScope = event.group_openid ? 'group' : 'c2c';
     const key = this.manager.sessionKey(scope, peerId);
-    const entry = this.pending.get(key);
-    if (!entry) {
-      this.logger.warn(`im-qqbot: button click with no pending question key=${key}`);
-      return false;
-    }
     let idx: unknown;
     try {
       idx = (JSON.parse(raw) as { i?: unknown }).i;
     } catch {
       this.logger.warn(`im-qqbot: unparseable button_data="${raw}"`);
-      return false;
+      return { kind: 'none' };
     }
-    const q = entry.request.questions?.[0];
-    const opts = q?.options ?? [];
-    if (typeof idx !== 'number' || !opts[idx]) {
-      this.logger.warn(`im-qqbot: button index out of range idx=${String(idx)} options=${opts.length}`);
-      return false;
+
+    // 1) 待答正式提问 → 提交答案
+    const entry = this.pending.get(key);
+    if (entry) {
+      const q = entry.request.questions?.[0];
+      const opts = q?.options ?? [];
+      if (typeof idx !== 'number' || !opts[idx]) {
+        this.logger.warn(`im-qqbot: button index out of range idx=${String(idx)} options=${opts.length}`);
+        return { kind: 'none' };
+      }
+      const option = opts[idx];
+      if (!option || !q) return { kind: 'none' };
+      this.pending.delete(key);
+      if (entry.onAbort && entry.request.signal) {
+        entry.request.signal.removeEventListener('abort', entry.onAbort);
+      }
+      this.logger.info(`im-qqbot: question answered via QQ button key=${key} option=${option.label}`);
+      entry.resolve({ answers: [{ id: q.id, selected: [option.label] }] });
+      return { kind: 'answered' };
     }
-    const option = opts[idx];
-    if (!option || !q) return false;
-    this.pending.delete(key);
-    if (entry.onAbort && entry.request.signal) {
-      entry.request.signal.removeEventListener('abort', entry.onAbort);
+
+    // 2) 快捷按钮 → 解析为"回复编号"，由调用方注入为用户消息
+    const labels = this.quickReplies.get(key);
+    if (labels && typeof idx === 'number' && labels[idx] !== undefined) {
+      const senderId = scope === 'group'
+        ? (event.group_member_openid ?? event.user_openid ?? peerId)
+        : (event.user_openid ?? peerId);
+      this.logger.info(`im-qqbot: quick-reply clicked key=${key} option=${idx + 1} ("${labels[idx]}")`);
+      return { kind: 'quick-reply', scope, peerId, senderId, text: String(idx + 1) };
     }
-    this.logger.info(`im-qqbot: question answered via QQ button key=${key} option=${option.label}`);
-    entry.resolve({ answers: [{ id: q.id, selected: [option.label] }] });
-    return true;
+
+    this.logger.warn(`im-qqbot: button click with no pending question or quick reply key=${key}`);
+    return { kind: 'none' };
   }
 }

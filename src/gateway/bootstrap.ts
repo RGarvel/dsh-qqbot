@@ -8,7 +8,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { QQBot } from '@tencent-connect/qqbot-nodejs';
 import type { MiddlewareContext } from '@tencent-connect/qqbot-nodejs';
 import { SessionManager, type DshAgentRegistry } from '../session/index.js';
-import { handleInbound, createOutboundHandler } from '../transport/index.js';
+import { handleInbound, createOutboundHandler, injectUserText } from '../transport/index.js';
 import type { ToolsRegistryLike } from '../transport/tool-presenter.js';
 import type { QQBotSender } from '../transport/outbound-buffer.js';
 import { buildUserAgent } from '../shared/index.js';
@@ -78,21 +78,30 @@ export async function bootstrapGateway(
     ),
   };
 
-  const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry);
-  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
-    .on('session/event', outboundHandler as (...args: unknown[]) => void);
-
-  // ── 交互式提问通道：QQ 会话的 ask_user_question 渲染为文本/按钮，回复即答案 ──
+  // ── 交互式提问通道：QQ 会话的 ask_user_question 双端出现（QQ 文本/按钮 + Web 卡片），
+  //    任一端先答即定案；并为尾部编号选项消息挂快捷按钮 ──
   const questionChannel = new QuestionChannel(manager, sender, config, logger);
   questionChannel.install(ctx as unknown as { get(name: string): unknown });
   manager.questionChannel = questionChannel;
 
-  // ── 按钮点击回调：解析为答案（平台要求 5 秒内 ACK） ──
+  const outboundHandler = createOutboundHandler(manager, sender, config, logger, toolsRegistry, questionChannel);
+  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
+    .on('session/event', outboundHandler as (...args: unknown[]) => void);
+
+  // ── 按钮点击回调：解析为答案/快捷回复（平台要求 5 秒内 ACK） ──
   bot.on('interaction', async (_iCtx, event) => {
     logger.info(`im-qqbot: interaction received id=${event?.id ?? '-'} button=${event?.data?.resolved?.button_id ?? '-'} data=${event?.data?.resolved?.button_data ?? '-'} from=${event?.group_openid ? 'group:' + event.group_openid : 'c2c:' + (event?.user_openid ?? '-')}`);
     let matched = false;
     try {
-      matched = questionChannel.handleInteraction(event);
+      const outcome = questionChannel.handleInteraction(event);
+      matched = outcome.kind !== 'none';
+      if (outcome.kind === 'quick-reply') {
+        // 点击等同回复编号：注入为用户消息，进入常规回合
+        void injectUserText(manager, outcome.scope, outcome.peerId, outcome.senderId, outcome.text, logger)
+          .catch((err: unknown) => {
+            logger.error(`im-qqbot: quick-reply inject failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+      }
     } catch (err) {
       logger.error(`im-qqbot: interaction handling failed: ${err instanceof Error ? err.message : String(err)}`);
     }

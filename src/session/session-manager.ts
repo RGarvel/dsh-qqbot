@@ -22,6 +22,7 @@ import type { ModelRoute, ModelEntry } from '../model/types.js';
 import { IdleEvictor } from './idle-evictor.js';
 import { attachSessionToWorkspace } from './workspace-attach.js';
 import { PeerMap } from './peer-map.js';
+import type { QuestionChannel } from '../features/question-channel.js';
 import type {
   SessionEventLike,
   DshAgent,
@@ -51,6 +52,8 @@ export class SessionManager {
   private readonly evictor: IdleEvictor;
   private readonly modelResolver: ModelResolver;
   private readonly peerMap: PeerMap;
+  /** 交互式提问通道（由 bootstrap 注入；入站消息据此截获"问题回答"） */
+  questionChannel?: QuestionChannel;
 
   constructor(
     private readonly ctx: Context,
@@ -243,7 +246,7 @@ export class SessionManager {
 
   // ── Session 生命周期管理 ──
 
-  private sessionKey(scope: ChatScope, peerId: string): string {
+  sessionKey(scope: ChatScope, peerId: string): string {
     return `qqbot:${this.config.appId}:${scope}:${peerId}`;
   }
 

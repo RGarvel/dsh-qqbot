@@ -399,12 +399,12 @@ export class SessionManager {
     }
   }
 
-  /** 出站桥接：按 sessionId 解析 QQ 对端（无活记录时兜底） */
-  resolvePeer(sessionId: string): { scope: ChatScope; peerId: string } | undefined {
+  /** 出站桥接 / 问题通道桥接：按 sessionId 解析 QQ 对端（无活记录时兜底） */
+  resolvePeer(sessionId: string): { scope: ChatScope; peerId: string; lastMsgId?: string } | undefined {
     const live = this.findBySessionId(sessionId);
-    if (live) return { scope: live.scope, peerId: live.peerId };
+    if (live) return { scope: live.scope, peerId: live.peerId, lastMsgId: live.replyTarget.msgId };
     const info = this.peerMap.get(sessionId);
-    if (info) return { scope: info.scope, peerId: info.peerId };
+    if (info) return { scope: info.scope, peerId: info.peerId, lastMsgId: info.lastMsgId };
     return undefined;
   }
 

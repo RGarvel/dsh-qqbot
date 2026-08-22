@@ -17,15 +17,16 @@ function createLogger(): Logger {
 }
 
 interface SentMessage {
+  target: ReplyTarget;
   text: string;
   opts?: { keyboard?: unknown };
 }
 
 function createSender(sent: SentMessage[], opts?: { failKeyboard?: boolean }) {
   return {
-    sendMarkdown: vi.fn(async (_target: ReplyTarget, content: string, o?: { keyboard?: unknown }) => {
+    sendMarkdown: vi.fn(async (target: ReplyTarget, content: string, o?: { keyboard?: unknown }) => {
       if (o?.keyboard && opts?.failKeyboard) throw new Error('keyboard not permitted');
-      sent.push({ text: content, opts: o });
+      sent.push({ target, text: content, opts: o });
     }),
   };
 }
@@ -276,25 +277,153 @@ describe('QuestionChannel.handleInteraction', () => {
   });
 });
 
-describe('QuestionChannel.install routing', () => {
-  it('routes QQ sessions to QQ channel and delegates others', async () => {
+describe('QuestionChannel.install routing（双端投递）', () => {
+  /** 模拟宿主 Web provider：挂起等待"用户在 Web 作答"，signal 中止即拒绝（撤卡片） */
+  function makeWebAsk() {
+    const calls: { signal?: AbortSignal; resolve: (r: UserQuestionResult) => void }[] = [];
+    const ask = vi.fn((request: UserQuestionRequest) => new Promise<UserQuestionResult>((resolve, reject) => {
+      calls.push({ signal: request.signal, resolve });
+      request.signal?.addEventListener('abort', () => reject(new Error('ASK_ABORTED')), { once: true });
+    }));
+    return { ask, calls };
+  }
+
+  it('non-QQ session delegates to the original ask untouched', async () => {
     const sent: SentMessage[] = [];
-    const record = makeRecord('qqbot:app:c2c:u9');
-    (record as { sessionId?: string }).sessionId = 'sess-qq';
-    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
-    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
-    let origCalled = 0;
-    const uq = { ask: vi.fn(async () => { origCalled += 1; return { answers: [] }; }) };
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
     ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
 
-    await uq.ask({ questions: [q2('x')], agent: { id: 'sess-web' } });
-    expect(origCalled).toBe(1);
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-web' } });
+    await sleep(10);
+    expect(calls).toHaveLength(1); // 原实现被调用
+    expect(sent).toHaveLength(0); // 未触碰 QQ
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['A'] }] });
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
+  });
+
+  it('QQ live record: dual delivery, QQ answers first → web card aborted', async () => {
+    const sent: SentMessage[] = [];
+    const record = makeRecord('qqbot:app:c2c:u9');
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
 
     const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
-    await new Promise((r) => setTimeout(r, 10));
+    await sleep(20);
+    expect(sent).toHaveLength(1); // QQ 端收到问题
+    expect(calls).toHaveLength(1); // Web 端同时弹卡片
+
     expect(ch.tryAnswer('qqbot:app:c2c:u9', '1')).toBe(true);
     expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
-    expect(origCalled).toBe(1); // QQ 路径未触碰原实现
+    await sleep(10);
+    expect(calls[0]?.signal?.aborted).toBe(true); // QQ 先答 → Web 卡片被撤
+  });
+
+  it('QQ live record: web answers first → QQ pending released', async () => {
+    const sent: SentMessage[] = [];
+    const record = makeRecord('qqbot:app:c2c:u9');
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
+    await sleep(20);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['B'] }] });
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
+    // QQ 待答登记已释放：之后的文本/点击不再被当作答案
+    expect(ch.tryAnswer('qqbot:app:c2c:u9', '1')).toBe(false);
+    expect(ch.handleInteraction({
+      id: 'i', type: 1, version: 1, user_openid: 'u9',
+      data: { type: 1, resolved: { button_data: JSON.stringify({ i: 0 }) } },
+    } as InteractionEvent)).toBe(false);
+  });
+
+  it('web-originated turn: bridges via peer map and dual delivers', async () => {
+    const sent: SentMessage[] = [];
+    // 无活跃记录（findBySessionId 落空），但持久化映射知道这是 QQ 会话
+    const manager = {
+      findBySessionId: () => undefined,
+      sessionKey,
+      resolvePeer: (id: string) => (id === 'sess-bridge'
+        ? { scope: 'c2c' as ChatScope, peerId: 'P9', lastMsgId: 'LM1' }
+        : undefined),
+    };
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-bridge' } });
+    await sleep(20);
+    expect(sent).toHaveLength(1);
+    // 桥接投递目标来自对端映射（带最近 msgId 走被动回复，过期由容错链兜底）
+    expect(sent[0]?.target.targetId).toBe('P9');
+    expect(sent[0]?.target.msgId).toBe('LM1');
+    expect(sent[0]?.opts?.keyboard).toBeDefined();
+    expect(calls).toHaveLength(1);
+
+    expect(ch.tryAnswer('qqbot:app:c2c:P9', '2')).toBe(true);
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
+  });
+
+  it('no live record and no peer mapping: web only', async () => {
+    const sent: SentMessage[] = [];
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-x' } });
+    await sleep(10);
+    expect(sent).toHaveLength(0);
+    expect(calls).toHaveLength(1);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['A'] }] });
+    await p;
+  });
+
+  it('QQ delivery failure degrades to web-only asking', async () => {
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const manager = {
+      findBySessionId: (id: string) => (id === 'sess-qq' ? makeRecord('qqbot:app:c2c:uf') : undefined),
+      sessionKey,
+    };
+    const ch = new QuestionChannel(
+      manager,
+      { sendMarkdown: vi.fn(async () => { throw new Error('network down'); }) },
+      { requireMention: false },
+      createLogger(),
+    );
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
+    await sleep(20);
+    expect(calls).toHaveLength(1);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['A'] }] });
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
+  });
+
+  it('turn abort rejects the dual ask (both sides released)', async () => {
+    const sent: SentMessage[] = [];
+    const record = makeRecord('qqbot:app:c2c:ua');
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
+    const { ask } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const ac = new AbortController();
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' }, signal: ac.signal });
+    await sleep(20);
+    ac.abort();
+    await expect(p).rejects.toThrow();
+    expect(ch.tryAnswer('qqbot:app:c2c:ua', '1')).toBe(false); // QQ 侧不再等待
   });
 
   it('uninstall restores the original ask', async () => {
@@ -317,5 +446,42 @@ describe('QuestionChannel.install routing', () => {
     const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false }, logger);
     ch.install({ get: () => undefined });
     expect(logger.warn).toHaveBeenCalled();
+  });
+});
+
+describe('QuestionChannel.deliverResilient（投递容错链）', () => {
+  it('retries without msgId when the passive send fails (stale msgId)', async () => {
+    const attempts: Array<{ msgId?: string; keyboard?: unknown }> = [];
+    const sender = {
+      sendMarkdown: vi.fn(async (target: ReplyTarget, _content: string, o?: { keyboard?: unknown }) => {
+        attempts.push({ msgId: target.msgId, keyboard: o?.keyboard });
+        if (target.msgId !== undefined) throw new Error('API Error: msg_id expired');
+      }),
+    };
+    const ch = new QuestionChannel(createManager(), sender, { requireMention: false }, createLogger());
+    const p = startAsk(ch, 'kr', [q2()]); // makeRecord 带 msgId='m'
+    await sleep(20);
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]?.msgId).toBe('m');
+    expect(attempts[1]?.msgId).toBeUndefined(); // 主动重发成功
+    expect(attempts[1]?.keyboard).toBeDefined(); // 重发仍带键盘
+    ch.tryAnswer('kr', '1');
+    await p;
+  });
+
+  it('falls back to wakeup for c2c text when both markdown attempts fail', async () => {
+    const wakeups: string[] = [];
+    const sender = {
+      sendMarkdown: vi.fn(async () => { throw new Error('proactive blocked'); }),
+      sendWakeup: vi.fn(async (_target: ReplyTarget, content: string) => { wakeups.push(content); }),
+    };
+    const ch = new QuestionChannel(createManager(), sender, { requireMention: false }, createLogger());
+    // 多题 → 无键盘 → 纯文本路径可达唤醒
+    const p = startAsk(ch, 'kw', [q2(), q2('q2')]);
+    await sleep(20);
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toContain('1. A');
+    ch.tryAnswer('kw', '统一回复');
+    await p;
   });
 });

@@ -21,6 +21,7 @@ import { ModelResolver } from '../model/model-resolver.js';
 import type { ModelRoute, ModelEntry } from '../model/types.js';
 import { IdleEvictor } from './idle-evictor.js';
 import { attachSessionToWorkspace } from './workspace-attach.js';
+import { PeerMap } from './peer-map.js';
 import type {
   SessionEventLike,
   DshAgent,
@@ -49,6 +50,7 @@ export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
   private readonly evictor: IdleEvictor;
   private readonly modelResolver: ModelResolver;
+  private readonly peerMap: PeerMap;
 
   constructor(
     private readonly ctx: Context,
@@ -57,6 +59,7 @@ export class SessionManager {
     private readonly logger: Logger,
   ) {
     this.modelResolver = new ModelResolver(ctx, config, logger);
+    this.peerMap = new PeerMap(logger);
 
     this.evictor = new IdleEvictor(
       this.sessions,
@@ -293,11 +296,13 @@ export class SessionManager {
     if (existing) {
       existing.replyTarget = replyTarget;
       existing.lastActivity = Date.now();
+      this.rememberPeer(existing.sessionId, scope, peerId, senderId, replyTarget.msgId);
       return existing;
     }
 
     const route = this.modelResolver.getEffectiveRoute(key);
     const sessionId = SessionId(this.currentSessionId(key));
+    this.rememberPeer(sessionId, scope, peerId, senderId, replyTarget.msgId);
     this.logger.info(`getOrCreate: key=${key} route=${route ? `${route.provider}/${route.model}` : 'host-default'} sessionId=${sessionId}`);
 
     let agent: DshAgent;
@@ -365,6 +370,35 @@ export class SessionManager {
       if (record.sessionId === sessionId) return record;
     }
     return undefined;
+  }
+
+  /** 记录 sessionId → QQ 对端映射（持久化，供 Web 回合桥接/回收后恢复） */
+  private rememberPeer(
+    sessionId: string,
+    scope: ChatScope,
+    peerId: string,
+    senderId: string,
+    lastMsgId: string | undefined,
+  ): void {
+    try {
+      this.peerMap.set(sessionId, { scope, peerId, senderId, lastMsgId, updatedAt: Date.now() });
+    } catch (err) {
+      this.logger.debug(`peer-map remember failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** 出站桥接：按 sessionId 解析 QQ 对端（无活记录时兜底） */
+  resolvePeer(sessionId: string): { scope: ChatScope; peerId: string } | undefined {
+    const live = this.findBySessionId(sessionId);
+    if (live) return { scope: live.scope, peerId: live.peerId };
+    const info = this.peerMap.get(sessionId);
+    if (info) return { scope: info.scope, peerId: info.peerId };
+    return undefined;
+  }
+
+  /** 进程内存活的 agent（可能不存在：已被宿主回收） */
+  liveAgent(sessionId: string): DshAgent | undefined {
+    return this.agents.get(sessionId);
   }
 
   findByAgent(agent: DshAgent): SessionRecord | undefined {

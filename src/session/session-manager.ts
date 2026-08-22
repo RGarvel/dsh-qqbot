@@ -22,6 +22,7 @@ import type { ModelRoute, ModelEntry } from '../model/types.js';
 import { IdleEvictor } from './idle-evictor.js';
 import { attachSessionToWorkspace } from './workspace-attach.js';
 import { PeerMap } from './peer-map.js';
+import { registerQuestionStyleSection } from './question-style.js';
 import type { QuestionChannel } from '../features/question-channel.js';
 import type {
   SessionEventLike,
@@ -320,6 +321,14 @@ export class SessionManager {
       // preset 只解析一次：resume/create 共用同一组合，避免重复 resolve/mount 目录
       const composed = await this.composePreset(this.config.preset);
       agentPreset = composed.agentPreset;
+      // 注入 QQ 提问规约：选择题必须走 ask_user_question（QQ 端才能渲染可点击按钮）
+      if (composed.setup) {
+        const inner = composed.setup;
+        composed.setup = async (agentCtx: Context) => {
+          await inner(agentCtx);
+          registerQuestionStyleSection(agentCtx, this.logger);
+        };
+      }
       try {
         const resumeRoute = this.modelResolver.getResumeRoute(key);
         const resumed = await this.agents.resume({

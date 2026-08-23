@@ -67,7 +67,14 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `groupPrompt` | string | - | 群聊额外 system prompt |
 | `directPrompt` | string | - | 私聊额外 system prompt |
 | `textChunkLimit` | number | `4500` | 单条消息最大字符数 |
+| `streaming` | boolean | `true` | 是否启用流式输出（群聊始终不启用） |
+| `mirrorWeb` | boolean | `true` | Web 端发起的回合镜像推送到 QQ：用户消息带「🌐 来自 Web」标记，机器人回复同步；QQ 内发起的回合自动跳过。闲置回收/宿主重启后凭持久化对端映射依然可达，可关 |
+| `quickReplyButtons` | boolean | `true` | 助手消息尾部出现编号选项（2–6 项）时自动追加可点击快捷按钮，点击等同回复编号；`ask_user_question` 单选带选项的问题同样附带按钮 |
+| `showToolResults` | boolean | `false` | 是否展示工具调用成功结果（错误始终展示） |
+| `processingTimeoutMs` | number | `120000` | 单回合处理超时(ms)，超时中止该回合 |
 | `sessionIdleTimeout` | number | `1800000` | 会话闲置超时(ms)，默认 30 分钟 |
+| `maxQueue` | number | `20` | 并发队列最大长度 |
+| `historyLimit` | number | `10` | 群历史缓冲条数 |
 | `debug` | boolean | `false` | 调试模式 |
 
 ## 内置命令

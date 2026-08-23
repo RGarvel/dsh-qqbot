@@ -5,6 +5,7 @@ import {
   buildKeyboard,
   formatQuestions,
   parseAnswers,
+  renderAnswerText,
   type UserQuestion,
   type UserQuestionRequest,
   type UserQuestionResult,
@@ -76,6 +77,29 @@ describe('formatQuestions', () => {
   it('notes multi-select usage', () => {
     const q: UserQuestion = { ...q2(), multiSelect: true };
     expect(formatQuestions([q], false, false)).toContain('可多选');
+  });
+});
+
+describe('renderAnswerText', () => {
+  it('single question: selected labels joined', () => {
+    expect(renderAnswerText([q2()], { answers: [{ id: 'q', selected: ['A', 'B'] }] })).toBe('A；B');
+  });
+
+  it('single question: custom text as-is', () => {
+    expect(renderAnswerText([q2()], { answers: [{ id: 'q', selected: [], custom: '唔，我想打会游戏' }] })).toBe('唔，我想打会游戏');
+  });
+
+  it('multi questions: each line prefixed with header/question', () => {
+    const qs: UserQuestion[] = [
+      { id: 'q1', question: '选一？', header: 'H1' },
+      { id: 'q2', question: '选二？' },
+    ];
+    const text = renderAnswerText(qs, { answers: [{ id: 'q1', selected: ['X'] }, { id: 'q2', selected: [], custom: 'Y' }] });
+    expect(text).toBe('H1: X\n选二？: Y');
+  });
+
+  it('empty answers → undefined', () => {
+    expect(renderAnswerText([q2()], { answers: [{ id: 'q', selected: [] }] })).toBeUndefined();
   });
 });
 
@@ -468,6 +492,90 @@ describe('QuestionChannel.install routing（双端投递）', () => {
     ac.abort();
     await expect(p).rejects.toThrow();
     expect(ch.tryAnswer('qqbot:app:c2c:ua', '1')).toBe(false); // QQ 侧不再等待
+  });
+
+  it('QQ 先答：答案回显写入会话日志，并门闩镜像（QQ 端已可见）', async () => {
+    const sent: SentMessage[] = [];
+    const inject = vi.fn();
+    const record = { ...makeRecord('qqbot:app:c2c:u9'), agent: { inject }, qqPendingTurns: 0 };
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
+    const { ask } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
+    await sleep(20);
+    ch.tryAnswer('qqbot:app:c2c:u9', '1');
+    await p;
+
+    expect(inject).toHaveBeenCalledTimes(1);
+    const msg = inject.mock.calls[0]?.[0] as { content: { text: string }[]; source: { kind: string } };
+    expect(msg.content[0]?.text).toBe('A'); // selected 用选项原文
+    expect(msg.source.kind).toBe('user');
+    expect(record.qqPendingTurns).toBe(1); // 出站镜像跳过，不重复推回 QQ
+  });
+
+  it('Web 先答：答案回显且不门闩（由出站镜像推回 QQ）', async () => {
+    const sent: SentMessage[] = [];
+    const inject = vi.fn();
+    const record = { ...makeRecord('qqbot:app:c2c:u9'), agent: { inject }, qqPendingTurns: 0 };
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined));
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
+    await sleep(20);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['B'], custom: '补充一句' }] });
+    await p;
+
+    expect(inject).toHaveBeenCalledTimes(1);
+    const msg = inject.mock.calls[0]?.[0] as { content: { text: string }[] };
+    expect(msg.content[0]?.text).toBe('B；补充一句');
+    expect(record.qqPendingTurns).toBe(0); // 不门闩 → 镜像「🌐 来自 Web」到 QQ
+  });
+
+  it('桥接会话：回显经 manager.liveAgent 注入', async () => {
+    const sent: SentMessage[] = [];
+    const inject = vi.fn();
+    const manager = {
+      findBySessionId: () => undefined,
+      sessionKey,
+      resolvePeer: (id: string) => (id === 'sess-bridge'
+        ? { scope: 'c2c' as ChatScope, peerId: 'P9', lastMsgId: 'LM1' }
+        : undefined),
+      liveAgent: (id: string) => (id === 'sess-bridge' ? { inject } : undefined),
+    };
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-bridge' } });
+    await sleep(20);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['A'] }] });
+    await p;
+
+    expect(inject).toHaveBeenCalledTimes(1);
+    const msg = inject.mock.calls[0]?.[0] as { content: { text: string }[] };
+    expect(msg.content[0]?.text).toBe('A');
+  });
+
+  it('agent 不可用：回显静默跳过，答案照常返回', async () => {
+    const sent: SentMessage[] = [];
+    const record = makeRecord('qqbot:app:c2c:u9'); // 无 agent
+    const manager = createManager((id) => (id === 'sess-qq' ? record : undefined)); // 无 liveAgent
+    const { ask, calls } = makeWebAsk();
+    const uq = { ask };
+    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false }, createLogger());
+    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
+
+    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
+    await sleep(20);
+    calls[0]?.resolve({ answers: [{ id: 'q', selected: ['A'] }] });
+    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
   });
 
   it('uninstall restores the original ask', async () => {

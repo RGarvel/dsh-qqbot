@@ -27,6 +27,7 @@
  * 答案契约与宿主一致：`{ answers: [{ id, selected: string[], custom? }] }`，
  * selected 使用选项的原文 label。
  */
+import { randomUUID } from 'node:crypto';
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { ChatScope, Logger, ReplyTarget } from '../types.js';
 import { detectTrailingOptions } from './quick-reply.js';
@@ -68,10 +69,19 @@ export interface UserQuestionsServiceLike {
 
 // ── 依赖的最小结构（SessionManager / QQBotSender 均结构化满足） ──
 
+/** 可把消息写回会话日志的 agent（只用 `inject`：记录进当前回合、不唤起新回合） */
+export interface QuestionAgentLike {
+  inject(message: { readonly content: unknown; readonly source: unknown }): void;
+}
+
 export interface QuestionSessionRecordLike {
   sessionKey: string;
   scope: ChatScope;
   replyTarget: ReplyTarget;
+  /** 活跃记录携带会话 agent（答案回显写日志用） */
+  agent?: QuestionAgentLike;
+  /** 活跃记录的镜像门闩计数（QQ 端答案回显时 +1，出站镜像据此跳过） */
+  qqPendingTurns?: number;
 }
 
 /** PeerMap 桥接信息：无活跃记录时据此起草 QQ 投递目标（Web 回合提问场景） */
@@ -86,6 +96,8 @@ export interface QuestionChannelManagerLike {
   sessionKey(scope: ChatScope, peerId: string): string;
   /** 可选：按 sessionId 查持久化的 QQ 对端映射（Web 回合桥接用） */
   resolvePeer?(sessionId: string): QuestionPeerInfoLike | undefined;
+  /** 可选：按 sessionId 查进程内存活 agent（桥接会话的答案回显用） */
+  liveAgent?(sessionId: string): QuestionAgentLike | undefined;
 }
 
 export interface QuestionChannelSenderLike {
@@ -186,6 +198,32 @@ export function formatQuestions(
     else lines.push(`回复编号选择${mention}，或直接输入文字作为自定义回答。`);
   }
   return lines.join('\n');
+}
+
+/**
+ * 把作答结果渲染成可读文本（答案回显用）：
+ * 单题直接给答案值；多题时逐行「问题头: 答案」。空答案返回 undefined。
+ */
+export function renderAnswerText(
+  questions: readonly UserQuestion[],
+  result: UserQuestionResult,
+): string | undefined {
+  const lines: string[] = [];
+  for (const ans of result.answers) {
+    const parts: string[] = [];
+    if (ans.selected.length > 0) parts.push(...ans.selected);
+    if (ans.custom) parts.push(ans.custom);
+    const value = parts.join('；');
+    if (!value) continue;
+    if (result.answers.length > 1) {
+      const q = questions.find((x) => x.id === ans.id);
+      lines.push(`${q?.header ?? q?.question ?? ans.id}: ${value}`);
+    } else {
+      lines.push(value);
+    }
+  }
+  const text = lines.join('\n').trim();
+  return text || undefined;
 }
 
 /** 把用户的 QQ 文本回复解析为答案（单题精确解析；多题降级为整段文字） */
@@ -373,6 +411,7 @@ export class QuestionChannel {
         detachForward();
         linked.abort(); // 宿主 provider 广播 question/resolved(cancelled)，Web 卡片撤下
         webPromise.catch(() => undefined); // 吞掉随之而来的 ASK_ABORTED
+        this.echoAnswer(request.agent?.id, request.questions, qqResult, 'qq');
         resolve(qqResult);
       });
 
@@ -381,6 +420,7 @@ export class QuestionChannel {
         settled = true;
         detachForward();
         this.releaseQqPending(record.sessionKey);
+        this.echoAnswer(request.agent?.id, request.questions, webResult, 'web');
         resolve(webResult);
       }).catch((err) => {
         webAlive = false;
@@ -399,6 +439,45 @@ export class QuestionChannel {
       entry.request.signal.removeEventListener('abort', entry.onAbort);
     }
     this.logger.info(`im-qqbot: QQ pending question released (answered elsewhere) key=${key}`);
+  }
+
+  /**
+   * 答案回显：把答案作为用户消息写回会话日志（`agent.inject`——记录进当前
+   * 回合的下一 step，不唤起新回合）。答案此前只存在于工具结果里，转录两端
+   * 都看不到；回显后：
+   *   - Web 转录出现这条答案（用户消息气泡）；
+   *   - QQ 端作答（文本/点按钮）：消息本就在 QQ 上可见，回显时把活跃记录的
+   *     `qqPendingTurns` +1，出站镜像据此跳过，不重复推回 QQ；
+   *   - Web 端作答：不门闩，出站层照常镜像「🌐 来自 Web：<答案>」到 QQ。
+   * Fail-soft：agent 不存在或注入失败仅记日志，绝不影响答案本身。
+   */
+  private echoAnswer(
+    sessionId: string | undefined,
+    questions: readonly UserQuestion[],
+    result: UserQuestionResult,
+    origin: 'qq' | 'web',
+  ): void {
+    try {
+      if (!sessionId) return;
+      const text = renderAnswerText(questions, result);
+      if (!text) return;
+      const live = this.manager.findBySessionId(sessionId);
+      const agent = live?.agent ?? this.manager.liveAgent?.(sessionId);
+      if (!agent || typeof agent.inject !== 'function') return;
+      if (origin === 'qq' && live) live.qqPendingTurns = (live.qqPendingTurns ?? 0) + 1;
+      // 与宿主 createUserMessage 运行时等价（id 为品牌化 UUID，消息冻结发布）；
+      // 不 import dsh-llm 以免给插件引入额外运行时依赖链。
+      const message = Object.freeze({
+        id: randomUUID(),
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text }],
+        source: { kind: 'user' as const },
+      });
+      agent.inject(message);
+      this.logger.info(`im-qqbot: answer echoed into session log origin=${origin} sid=${sessionId} text="${text.slice(0, 60)}"`);
+    } catch (err) {
+      this.logger.warn(`im-qqbot: answer echo failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**

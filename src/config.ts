@@ -80,6 +80,8 @@ export interface ImQQBotConfig {
   processingTimeoutMs: number;
   /** 待答问题超时(ms)，超时自动拒绝并提示（ask_user_question） */
   askTimeoutMs: number;
+  /** 快捷按钮：助手消息尾部编号选项自动补挂可点击按钮（点击等同回复编号） */
+  quickReplyButtons: boolean;
   /** 群历史缓冲条数 */
   historyLimit: number;
   /** 访问控制 */
@@ -113,6 +115,7 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   maxQueue: Schema.number().default(20).description('并发队列最大长度'),
   processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
   askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
+  quickReplyButtons: Schema.boolean().default(true).description('助手消息尾部编号选项自动补挂可点击按钮（点击等同回复编号）'),
   historyLimit: Schema.number().default(10).description('群历史缓冲条数'),
   access: Schema.object({
     c2cMode: Schema.union(['open', 'allowlist', 'disabled']).default('open').description('C2C访问模式'),

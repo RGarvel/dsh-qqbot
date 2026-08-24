@@ -19,6 +19,7 @@
  *   - 关闭时（单测默认）保持 QQ 单端行为。
  */
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
+import { randomUUID } from 'node:crypto';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { parseAnswer } from './answer-parser.ts';
 import { buildKeyboard, formatQuestion } from './question-renderer.ts';
@@ -71,6 +72,8 @@ export interface QuestionSessionRecordLike {
   sessionKey: string;
   scope: ChatScope;
   replyTarget: ReplyTarget;
+  /** 会话 id（答案回显定位活跃记录用；活跃 SessionRecord 天然携带） */
+  sessionId?: string;
   /** 活跃记录携带会话 agent（答案回显写日志用） */
   agent?: QuestionAgentLike;
   /** 活跃记录的镜像门闩计数（QQ 端答案回显时 +1，出站镜像据此跳过） */
@@ -128,6 +131,32 @@ class QuestionChannelError extends Error {
 }
 
 // ── 每会话状态机 ──
+
+/**
+ * 把作答结果渲染成可读文本（答案回显用）：
+ * 单题直接给答案值；多题时逐行「问题头: 答案」。空答案返回 undefined。
+ */
+export function renderAnswerText(
+  questions: readonly UserQuestion[],
+  result: UserQuestionResult,
+): string | undefined {
+  const lines: string[] = [];
+  for (const ans of result.answers) {
+    const parts: string[] = [];
+    if (ans.selected.length > 0) parts.push(...ans.selected);
+    if (ans.custom) parts.push(ans.custom);
+    const value = parts.join('；');
+    if (!value) continue;
+    if (result.answers.length > 1) {
+      const q = questions.find((x) => x.id === ans.id);
+      lines.push(`${q?.header ?? q?.question ?? ans.id}: ${value}`);
+    } else {
+      lines.push(value);
+    }
+  }
+  const text = lines.join('\n').trim();
+  return text || undefined;
+}
 
 interface PendingEntry {
   record: QuestionSessionRecordLike;
@@ -192,6 +221,7 @@ export class QuestionChannel {
         if (peer) {
           const bridged: QuestionSessionRecordLike = {
             sessionKey: self.manager.sessionKey?.(peer.scope, peer.peerId) ?? `bridge:${sessionId}`,
+            sessionId,
             scope: peer.scope,
             replyTarget: { scope: peer.scope, targetId: peer.peerId, msgId: peer.lastMsgId },
             agent: self.manager.liveAgent?.(sessionId),
@@ -328,6 +358,7 @@ export class QuestionChannel {
         detachForward();
         linked.abort(); // 宿主 provider 广播 question/resolved(cancelled)，Web 卡片撤下
         webPromise.catch(() => undefined); // 吞掉随之而来的 ASK_ABORTED
+        this.echoAnswer(record, request, qqResult, 'qq');
         resolve(qqResult);
       });
 
@@ -336,6 +367,7 @@ export class QuestionChannel {
         settled = true;
         detachForward();
         this.releaseQqPending(record.sessionKey);
+        this.echoAnswer(record, request, webResult, 'web');
         resolve(webResult);
       }).catch((err) => {
         webAlive = false;
@@ -354,6 +386,45 @@ export class QuestionChannel {
     this.removeAbort(entry);
     entry.reject(new QuestionChannelError('ask_user_question was released: answered on the other side', ASK_ABORTED));
     this.logger.info(`im-qqbot: QQ pending question released (answered elsewhere) key=${key}`);
+  }
+
+  /**
+   * 答案回显：把答案作为用户消息写回会话日志（`agent.inject`——记录进当前
+   * 回合的下一 step，不唤起新回合）。答案此前只存在于工具结果里，转录两端
+   * 都看不到；回显后：
+   *   - Web 转录出现这条答案（用户消息气泡）；
+   *   - QQ 端作答（文本/点按钮）：消息本就在 QQ 上可见，回显时把活跃记录的
+   *     `qqPendingTurns` +1，出站镜像据此跳过，不重复推回 QQ；
+   *   - Web 端作答：不门闩，出站层照常镜像「🌐 来自 Web：<答案>」到 QQ。
+   * Fail-soft：agent 不存在或注入失败仅记日志，绝不影响答案本身。
+   */
+  private echoAnswer(
+    record: QuestionSessionRecordLike,
+    request: UserQuestionRequest,
+    result: UserQuestionResult,
+    origin: 'qq' | 'web',
+  ): void {
+    try {
+      const text = renderAnswerText(request.questions, result);
+      if (!text) return;
+      const sessionId = record.sessionId;
+      const live = sessionId ? this.manager.findBySessionId(sessionId) : undefined;
+      const agent = live?.agent ?? record.agent;
+      if (!agent || typeof agent.inject !== 'function') return;
+      if (origin === 'qq' && live) live.qqPendingTurns = (live.qqPendingTurns ?? 0) + 1;
+      // 与宿主 createUserMessage 运行时等价（id 为品牌化 UUID，消息冻结发布）；
+      // 不 import dsh-llm 以免给插件引入额外运行时依赖链。
+      const message = Object.freeze({
+        id: randomUUID(),
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text }],
+        source: { kind: 'user' as const },
+      });
+      agent.inject(message);
+      this.logger.info(`im-qqbot: answer echoed into session log origin=${origin} text="${text.slice(0, 60)}"`);
+    } catch (err) {
+      this.logger.warn(`im-qqbot: answer echo failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** 走 QQ 通道：发送首题 + 挂起 Promise，等待逐题作答 */

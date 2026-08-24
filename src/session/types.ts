@@ -32,6 +32,8 @@ export interface DshAgent {
   };
   cancel(cause: { kind: string }): void;
   followup(message: unknown): void;
+  /** 注入模型上下文：不唤起新回合，运行中的回合在下一 step 边界认领 */
+  inject(message: unknown): void;
   whenIdle(): Promise<void>;
   /** 运行一个非 turn 维护任务（compact 等需要 idle 时串行执行的操作） */
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>;

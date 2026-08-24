@@ -8,6 +8,15 @@
  *   - 待答（pending 中）：等待当前题的回答
  *   - 逐题推进：多问题时一次问一题，答完一题再问下一题
  *   - 完成 / 中断（abort / 超时 / 会话回收）：reject(ASK_ABORTED)
+ *
+ * 双端同步（questionSync，生产默认开启）：
+ *   - QQ 会话（含经持久化对端映射桥接的——如网页端继续的 QQ 会话）提问时
+ *     **双端出现**：QQ 逐题发文本/按钮，Web 照常弹卡片；整个请求粒度竞速，
+ *     先完成全部题的一端定案（QQ 先答 → 中止 signal 撤下 Web 卡片；
+ *     Web 先答 → 释放 QQ 待答登记，QQ 端输入回归常规消息流）。
+ *   - QQ 投递失败/超时不影响 Web 作答；Web provider 失败不影响 QQ 作答；
+ *     两端都失败才整体拒绝。
+ *   - 关闭时（单测默认）保持 QQ 单端行为。
  */
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
@@ -53,24 +62,54 @@ export interface UserQuestionsServiceLike {
 
 // ── 依赖接口（结构化，便于单测） ──
 
+/** 可把消息写回会话日志的 agent（只用 `inject`：记录进当前回合、不唤起新回合） */
+export interface QuestionAgentLike {
+  inject(message: { readonly content: unknown; readonly source: unknown }): void;
+}
+
 export interface QuestionSessionRecordLike {
   sessionKey: string;
   scope: ChatScope;
   replyTarget: ReplyTarget;
+  /** 活跃记录携带会话 agent（答案回显写日志用） */
+  agent?: QuestionAgentLike;
+  /** 活跃记录的镜像门闩计数（QQ 端答案回显时 +1，出站镜像据此跳过） */
+  qqPendingTurns?: number;
+}
+
+/** PeerMap 桥接信息：无活跃记录时据此起草 QQ 投递目标（Web 回合提问场景） */
+export interface QuestionPeerInfoLike {
+  scope: ChatScope;
+  peerId: string;
+  lastMsgId?: string;
 }
 
 export interface QuestionChannelManagerLike {
   findBySessionId(sessionId: string): QuestionSessionRecordLike | undefined;
   getSessionRecord(scope: ChatScope, peerId: string): QuestionSessionRecordLike | undefined;
+  /** 规范会话键（快捷按钮登记/点击匹配用；测试桩可缺省） */
+  sessionKey?(scope: ChatScope, peerId: string): string;
+  /** 可选：按 sessionId 查持久化的 QQ 对端映射（Web 回合桥接用） */
+  resolvePeer?(sessionId: string): QuestionPeerInfoLike | undefined;
+  /** 可选：按 sessionId 查进程内存活 agent（桥接会话的答案回显用） */
+  liveAgent?(sessionId: string): QuestionAgentLike | undefined;
 }
 
 export interface QuestionChannelSenderLike {
   sendMarkdown(target: ReplyTarget, content: string, opts?: { keyboard?: InlineKeyboard }): Promise<unknown>;
+  /** 可选：c2c 唤醒投递（被动/主动都失败时的最后手段，不支持键盘） */
+  sendWakeup?(target: ReplyTarget, content: string): Promise<unknown>;
 }
 
 export interface QuestionChannelConfigLike {
   requireMention: boolean;
   askTimeoutMs: number;
+  /**
+   * 双端同步：QQ 会话的提问同时出现在 QQ 与 Web，先答先得。
+   * 未设置（如单测直接构造）→ 关闭，保持 QQ 单端行为；
+   * 生产配置 schema 默认 true。
+   */
+  questionSync?: boolean;
 }
 
 // ── 错误语义（对齐 dsh-user-questions 的 UserQuestionError code 约定） ──
@@ -125,8 +164,8 @@ export class QuestionChannel {
   }
 
   /**
-   * 包装 userQuestions.ask：QQ 会话走 QQ 通道，其余委托原实现。
-   * 幂等（已 patch 则跳过）；服务缺失或 ask 非函数时优雅禁用。
+   * 包装 userQuestions.ask：QQ 会话走 QQ 通道（questionSync 时双端同步），
+   * 其余委托原实现。幂等（已 patch 则跳过）；服务缺失或 ask 非函数时优雅禁用。
    */
   public install(ctx: { get(name: string): unknown }): void {
     const uq = ctx.get('userQuestions') as UserQuestionsServiceLike | undefined;
@@ -141,7 +180,25 @@ export class QuestionChannel {
     uq.ask = async function qqRoutedAsk(request: UserQuestionRequest): Promise<UserQuestionResult> {
       const sessionId = request?.agent?.id;
       const record = sessionId ? self.manager.findBySessionId(sessionId) : undefined;
-      if (record) return self.askViaQQ(record, request);
+      if (record) {
+        return self.config.questionSync === true
+          ? self.askDual(record, request, self.origAsk!)
+          : self.askViaQQ(record, request);
+      }
+      // Web 回合桥接：无活跃记录，但持久化映射知道这是 QQ 会话（如网页端继续的
+      // QQ 会话）→ 起草投递目标，问题同样双端出现（QQ 可作答，Web 弹卡片）
+      if (self.config.questionSync === true && sessionId) {
+        const peer = self.manager.resolvePeer?.(sessionId);
+        if (peer) {
+          const bridged: QuestionSessionRecordLike = {
+            sessionKey: self.manager.sessionKey?.(peer.scope, peer.peerId) ?? `bridge:${sessionId}`,
+            scope: peer.scope,
+            replyTarget: { scope: peer.scope, targetId: peer.peerId, msgId: peer.lastMsgId },
+            agent: self.manager.liveAgent?.(sessionId),
+          };
+          return self.askDual(bridged, request, self.origAsk!);
+        }
+      }
       return self.origAsk!(request);
     };
     Object.defineProperty(uq, '__qqQuestionPatched', { value: true, configurable: true, enumerable: false });
@@ -217,6 +274,88 @@ export class QuestionChannel {
     return true;
   }
 
+  /**
+   * 双端提问：QQ 会话的问题同时投到 QQ（逐题文本/按钮）与 Web（弹卡片），
+   * 整个请求粒度竞速，先完成全部题的一端定案，另一端随即清理：
+   *   - QQ 先答 → 中止传给 Web 的 signal（宿主 provider 收到 abort 即撤下卡片）；
+   *   - Web 先答 → 释放 QQ 待答登记（之后的 QQ 文本/点击回归常规消息流）。
+   * QQ 投递失败/超时不影响 Web 端作答；Web provider 失败不影响 QQ 端作答；
+   * 两端都失败才整体拒绝。
+   */
+  async askDual(
+    record: QuestionSessionRecordLike,
+    request: UserQuestionRequest,
+    origAsk: (request: UserQuestionRequest) => Promise<UserQuestionResult>,
+  ): Promise<UserQuestionResult> {
+    // 链接中止：回合中止 → 撤 Web 卡片；QQ 先答 → 撤 Web 卡片
+    const linked = new AbortController();
+    const forwardAbort = (): void => linked.abort();
+    if (request.signal) {
+      if (request.signal.aborted) linked.abort();
+      else request.signal.addEventListener('abort', forwardAbort, { once: true });
+    }
+    const detachForward = (): void => {
+      if (request.signal) request.signal.removeEventListener('abort', forwardAbort);
+    };
+
+    const webPromise = origAsk({ ...request, signal: linked.signal });
+    const qqPromise = this.askViaQQ(record, request).catch((err) => {
+      this.logger.warn(`im-qqbot: QQ question unavailable, web only: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    });
+
+    return new Promise<UserQuestionResult>((resolve, reject) => {
+      let settled = false;
+      let qqAlive = true;
+      let webAlive = true;
+      let webError: unknown;
+
+      const failIfBothDead = (): void => {
+        if (settled || qqAlive || webAlive) return;
+        settled = true;
+        detachForward();
+        reject(webError instanceof Error ? webError : new Error('failed to ask the user on both QQ and Web'));
+      };
+
+      void qqPromise.then((qqResult) => {
+        if (qqResult === undefined) {
+          qqAlive = false;
+          failIfBothDead();
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        detachForward();
+        linked.abort(); // 宿主 provider 广播 question/resolved(cancelled)，Web 卡片撤下
+        webPromise.catch(() => undefined); // 吞掉随之而来的 ASK_ABORTED
+        resolve(qqResult);
+      });
+
+      void webPromise.then((webResult) => {
+        if (settled) return;
+        settled = true;
+        detachForward();
+        this.releaseQqPending(record.sessionKey);
+        resolve(webResult);
+      }).catch((err) => {
+        webAlive = false;
+        webError = err;
+        failIfBothDead();
+      });
+    });
+  }
+
+  /** Web 先作答后放弃 QQ 端等待：移除待答登记，QQ 文本/点击回归常规消息流 */
+  private releaseQqPending(key: string): void {
+    const entry = this.pending.get(key);
+    if (!entry) return;
+    this.pending.delete(key);
+    this.clearTimer(entry);
+    this.removeAbort(entry);
+    entry.reject(new QuestionChannelError('ask_user_question was released: answered on the other side', ASK_ABORTED));
+    this.logger.info(`im-qqbot: QQ pending question released (answered elsewhere) key=${key}`);
+  }
+
   /** 走 QQ 通道：发送首题 + 挂起 Promise，等待逐题作答 */
   private async askViaQQ(record: QuestionSessionRecordLike, request: UserQuestionRequest): Promise<UserQuestionResult> {
     const key = record.sessionKey;
@@ -287,17 +426,44 @@ export class QuestionChannel {
     try {
       if (keyboard) {
         try {
-          await this.sender.sendMarkdown(record.replyTarget, formatQuestion(question, hint, true), { keyboard });
+          await this.deliverResilient(record.replyTarget, formatQuestion(question, hint, true), keyboard);
           return;
         } catch (err) {
           this.logger.warn(`im-qqbot: keyboard send failed, fallback to text: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      await this.sender.sendMarkdown(record.replyTarget, formatQuestion(question, hint, false));
+      await this.deliverResilient(record.replyTarget, formatQuestion(question, hint, false));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.error(`im-qqbot: question send failed key=${record.sessionKey}: ${msg}`);
       throw new Error(`failed to deliver question to QQ: ${msg}`);
+    }
+  }
+
+  /**
+   * 容错投递：被动回复（带 msgId）→ 主动消息（去 msgId，应对过期——
+   * 桥接/回收后恢复的投递目标 msgId 通常已失效）→ c2c 唤醒（仅纯文本，
+   * 键盘不支持）。全部失败抛出最后一个错误。
+   */
+  private async deliverResilient(target: ReplyTarget, text: string, keyboard?: InlineKeyboard): Promise<void> {
+    const opts = keyboard !== undefined ? { keyboard } : undefined;
+    try {
+      await this.sender.sendMarkdown(target, text, opts);
+      return;
+    } catch (err) {
+      if (target.msgId === undefined) throw err;
+      this.logger.warn(`im-qqbot: question send (passive) failed, retry active: ${err instanceof Error ? err.message : String(err)}`);
+      try {
+        await this.sender.sendMarkdown({ scope: target.scope, targetId: target.targetId }, text, opts);
+        return;
+      } catch (err2) {
+        if (target.scope === 'c2c' && keyboard === undefined && this.sender.sendWakeup) {
+          this.logger.warn(`im-qqbot: question send (active) failed, retry wakeup: ${err2 instanceof Error ? err2.message : String(err2)}`);
+          await this.sender.sendWakeup(target, text);
+          return;
+        }
+        throw err2;
+      }
     }
   }
 

@@ -431,7 +431,11 @@ export class SessionManager {
 
   // ── Session 生命周期管理 ──
 
-  private sessionKey(scope: ChatScope, peerId: string): string {
+  /**
+   * 规范会话键。出站快捷按钮登记/点击匹配、问题通道桥接需要与
+   * SessionManager 内部一致的键格式，故公开。
+   */
+  sessionKey(scope: ChatScope, peerId: string): string {
     return `qqbot:${this.config.appId}:${scope}:${peerId}`;
   }
 

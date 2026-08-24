@@ -153,6 +153,30 @@ export async function handleInbound(
   }
 }
 
+/**
+ * 注入一条纯文本用户消息（快捷按钮点击：点击等同回复编号）。
+ * 与 QQ 入站同语义：followup + qqPendingTurns++（消息已在 QQ 端，跳过镜像）。
+ * 不携带 msgId —— 后续回复走主动投递（点击时机与原消息通常已脱节）。
+ */
+export async function injectUserText(
+  manager: SessionManager,
+  scope: ChatScope,
+  peerId: string,
+  senderId: string,
+  text: string,
+  logger: Logger,
+): Promise<void> {
+  const replyTarget: ReplyTarget = { scope, targetId: peerId };
+  const record = await manager.getOrCreate(scope, peerId, senderId, replyTarget);
+  const message = createUserMessage({
+    content: [{ type: 'text' as const, text }],
+    source: { kind: 'user' as const },
+  });
+  record.agent.followup(message);
+  record.qqPendingTurns = (record.qqPendingTurns ?? 0) + 1;
+  logger.info(`im-qqbot: quick reply injected: key=${scope}:${peerId} text="${text}"`);
+}
+
 // ══════════════════════════════════════════════════════════════
 // Body Assembly（5 层组装）
 // ══════════════════════════════════════════════════════════════

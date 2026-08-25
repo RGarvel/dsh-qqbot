@@ -90,6 +90,7 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `sessionIdleTimeout` | number | `1800000` | 会话闲置超时(ms)，默认 30 分钟 |
 | `mirrorWeb` | boolean | `true` | Web 端发起的回合镜像推送到 QQ（用户消息带标记 + 机器人回复） |
 | `askTimeoutMs` | number | `300000` | 待答问题超时(ms)，默认 5 分钟（ask_user_question） |
+| `quickReplyButtons` | boolean | `true` | 助手消息尾部编号选项自动补挂可点击按钮（点击等同回复编号） |
 | `debug` | boolean | `false` | 调试模式 |
 
 ## 内置命令

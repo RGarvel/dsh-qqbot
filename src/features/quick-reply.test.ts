@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { detectTrailingOptions, stripInlineMarkdown } from './quick-reply.js';
+import { detectTrailingOptions, stripInlineMarkdown } from './quick-reply.ts';
 
 /** 真实案例 A（seq 32151）：澄清提问，编号块结尾 */
 const MSG_A = `「同步web端记录」我想确认下具体指哪个，因为有几个不同的目标，操作方式不一样：

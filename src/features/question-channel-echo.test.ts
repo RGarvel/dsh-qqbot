@@ -6,8 +6,8 @@ import {
   type UserQuestionResult,
   type QuestionSessionRecordLike,
   type QuestionAgentLike,
-} from './question-channel.js';
-import type { ChatScope, Logger, ReplyTarget } from '../types.js';
+} from './question-channel.ts';
+import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 
 function createLogger(): Logger {
   return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };

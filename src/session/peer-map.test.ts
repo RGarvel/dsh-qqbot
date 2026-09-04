@@ -62,4 +62,29 @@ describe('PeerMap', () => {
     const reloaded = new PeerMap(undefined, file);
     expect(reloaded.get('sess-1')?.lastMsgId).toBe('m2');
   });
+
+  it('setByPeer removes stale entries for the same (scope, peerId)', () => {
+    const map = new PeerMap(undefined, file);
+    map.set('sess-old-1', { scope: 'c2c', peerId: 'P1', senderId: 'U1', updatedAt: 1 });
+    map.set('sess-old-2', { scope: 'c2c', peerId: 'P1', senderId: 'U1', updatedAt: 2 });
+    map.set('other-peer', { scope: 'c2c', peerId: 'P2', senderId: 'U2', updatedAt: 3 });
+
+    map.setByPeer('sess-current', { scope: 'c2c', peerId: 'P1', senderId: 'U1', updatedAt: 4 });
+
+    expect(map.get('sess-current')?.peerId).toBe('P1');
+    expect(map.get('sess-old-1')).toBeUndefined();
+    expect(map.get('sess-old-2')).toBeUndefined();
+    // 不同 peer 的条目不受影响
+    expect(map.get('other-peer')?.peerId).toBe('P2');
+  });
+
+  it('setByPeer dedupe persists across a fresh reload', () => {
+    const map = new PeerMap(undefined, file);
+    map.set('sess-old', { scope: 'group', peerId: 'G1', senderId: 'U1', updatedAt: 1 });
+    map.setByPeer('sess-new', { scope: 'group', peerId: 'G1', senderId: 'U1', updatedAt: 2 });
+
+    const fresh = new PeerMap(undefined, file);
+    expect(fresh.get('sess-old')).toBeUndefined();
+    expect(fresh.get('sess-new')?.peerId).toBe('G1');
+  });
 });

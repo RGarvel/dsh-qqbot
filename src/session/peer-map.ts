@@ -46,6 +46,22 @@ export class PeerMap {
     this.save(map);
   }
 
+  /**
+   * 写入并保证「一个 QQ 对端（scope+peerId）只保留一条映射」：先删除同对端的
+   * 其它 sessionId 条目，再写入当前条目（原子转移）。用于换绑/迁移场景，避免
+   * 反复换绑后同一 peer 累积出多个 sessionId、出站镜像错乱。
+   */
+  public setByPeer(sessionId: string, info: PeerInfo): void {
+    const map = this.load();
+    for (const [existingId, existing] of map.entries()) {
+      if (existingId !== sessionId && existing.scope === info.scope && existing.peerId === info.peerId) {
+        map.delete(existingId);
+      }
+    }
+    map.set(sessionId, info);
+    this.save(map);
+  }
+
   private load(): Map<string, PeerInfo> {
     if (this.cache !== null) return this.cache;
     const cache = new Map<string, PeerInfo>();

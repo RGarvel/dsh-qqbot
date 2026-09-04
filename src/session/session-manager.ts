@@ -569,7 +569,7 @@ export class SessionManager {
     lastMsgId: string | undefined,
   ): void {
     try {
-      this.peerMap.set(sessionId, { scope, peerId, senderId, lastMsgId, updatedAt: Date.now() });
+      this.peerMap.setByPeer(sessionId, { scope, peerId, senderId, lastMsgId, updatedAt: Date.now() });
     } catch (err) {
       this.logger.debug(`peer-map remember failed: ${err instanceof Error ? err.message : String(err)}`);
     }

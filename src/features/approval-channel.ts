@@ -55,7 +55,11 @@ export interface ApprovalChannelSenderLike {
 /** approval/request waterfall 的 answerer handler */
 export interface ApprovalChannelContext {
   get(name: string): unknown;
-  on(event: string, handler: (...args: unknown[]) => unknown): void;
+  on(
+    event: string,
+    handler: (...args: unknown[]) => unknown,
+    options?: { prepend?: boolean },
+  ): void;
 }
 
 // ── 每会话 pending 状态 ──
@@ -135,7 +139,7 @@ export class ApprovalChannel {
       const record = self.manager.findBySessionId(request.agent.id);
       if (record) return self.park(record, request);
       return nextFn();
-    });
+    }, { prepend: true });
     this.logger.info('im-qqbot: QQ approval channel installed');
   }
 

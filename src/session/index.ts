@@ -16,6 +16,8 @@ export type {
   PresetComposition,
   PresetEntry,
   PresetSwitchOutcome,
+  SwitchOutcome,
+  SwitchableSession,
   SessionRecord,
   SessionStatus,
   TokenUsageStats,

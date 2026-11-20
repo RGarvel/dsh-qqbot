@@ -69,6 +69,23 @@ export interface PresetSwitchOutcome {
   message?: string;
 }
 
+/** /switch 重绑结果 */
+export interface SwitchOutcome {
+  ok: boolean;
+  reason?: 'not-found' | 'same-session' | 'failed';
+  sessionId?: string;
+  message?: string;
+}
+
+/** /switch 可切换候选会话（供无参数列出） */
+export interface SwitchableSession {
+  sessionId: string;
+  cwd?: string;
+  createdAt: number;
+  eventCount?: number;
+  isCurrent: boolean;
+}
+
 export interface DshAgentHandle {
   agent: DshAgent;
   dispose(): Promise<void>;

@@ -34,6 +34,8 @@ import type {
   PresetComposition,
   PresetEntry,
   PresetSwitchOutcome,
+  SwitchOutcome,
+  SwitchableSession,
   SessionRecord,
   SessionStatus,
   TokenUsageStats,
@@ -162,6 +164,22 @@ export class SessionManager {
   private getPresetsService(): AgentPresetsLike | undefined {
     try {
       return this.ctx.get('agentPresets') as AgentPresetsLike | undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * 动态获取 sessionPersistence 服务（可选）。/switch 列出候选会话依赖它；
+   * 缺席时静默返回 undefined，命令层优雅降级为「无法列出会话」。
+   */
+  private getPersistenceService(): { list(): Promise<readonly { header: { id: string; origin?: string; createdAt: number; cwd?: string }; sizeBytes?: number }[]> } | undefined {
+    try {
+      const svc = this.ctx.get('sessionPersistence') as
+        | { list?: (...args: unknown[]) => Promise<readonly { header: { id: string; origin?: string; createdAt: number; cwd?: string }; sizeBytes?: number }[]> }
+        | undefined;
+      if (svc && typeof svc.list === 'function') return { list: () => svc.list!() };
+      return undefined;
     } catch {
       return undefined;
     }
@@ -655,6 +673,97 @@ export class SessionManager {
       this.logger.warn(`compact failed: key=${key} err=${message}`);
       return { ok: false, reason: 'failed', message };
     }
+  }
+
+  /**
+   * 列出 /switch 可切换的候选会话：本进程可见的全部 top-level（非 subagent）会话，
+   * 按创建时间倒序。当前 peer 绑定的会话标 isCurrent。sessionPersistence 缺席时返回空。
+   */
+  async listSwitchableSessions(scope: ChatScope, peerId: string): Promise<SwitchableSession[]> {
+    const persistence = this.getPersistenceService();
+    if (!persistence) return [];
+
+    let snapshots: readonly { header: { id: string; origin?: string; createdAt: number; cwd?: string }; sizeBytes?: number }[];
+    try {
+      snapshots = await persistence.list();
+    } catch (err) {
+      this.logger.warn(`list sessions failed: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+
+    const currentId = this.sessions.get(this.sessionKey(scope, peerId))?.sessionId
+      ?? this.modelResolver.getSessionId(this.sessionKey(scope, peerId));
+
+    return snapshots
+      .filter((s) => s.header.origin !== 'subagent')
+      .map((s) => ({
+        sessionId: s.header.id,
+        cwd: s.header.cwd,
+        createdAt: s.header.createdAt,
+        eventCount: undefined,
+        isCurrent: s.header.id === currentId,
+      }))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * 将当前 QQ 对端重绑到指定已有会话（/switch 核心）。
+   *
+   * 语义 = 宿主 rebind_qq_channel 的 QQ 侧等价物：
+   *   1. 目标 session 必须已存在于 sessionPersistence（否则 not-found）；
+   *   2. 更新 prefs.sessionIds[sessionKey] → targetSessionId（重启后恢复到此会话）；
+   *   3. PeerMap.setByPeer 写入 targetSessionId → 当前 peer（自动删除旧 sessionId 条目，去重）；
+   *   4. 淘汰内存里的旧 record，让下一条消息 getOrCreate 按新 sessionId resume。
+   */
+  async switchSession(
+    scope: ChatScope,
+    peerId: string,
+    targetSessionId: string,
+  ): Promise<SwitchOutcome> {
+    const key = this.sessionKey(scope, peerId);
+
+    // 已是当前会话 → 幂等成功，避免无谓 dispose
+    const current = this.sessions.get(key);
+    if (current?.sessionId === targetSessionId) {
+      return { ok: true, sessionId: targetSessionId };
+    }
+
+    // 目标会话必须真实存在（resume 才有意义，防止把 peer 绑到悬空 id）
+    const persistence = this.getPersistenceService();
+    if (persistence) {
+      let found = false;
+      try {
+        const snapshots = await persistence.list();
+        found = snapshots.some((s) => s.header.id === targetSessionId);
+      } catch (err) {
+        this.logger.warn(`switch validate list failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!found) return { ok: false, reason: 'not-found', message: `会话 ${targetSessionId} 不存在` };
+    }
+
+    // 记录 senderId / lastMsgId：优先沿用当前 record，否则用 peerId 兜底
+    const senderId = current?.senderId ?? peerId;
+    const lastMsgId = current?.replyTarget?.msgId;
+    this.peerMap.setByPeer(targetSessionId, {
+      scope,
+      peerId,
+      senderId,
+      lastMsgId,
+      updatedAt: Date.now(),
+    });
+
+    // prefs.sessionIds 持久化重绑（fork 后恢复的权威来源）
+    this.modelResolver.setSessionId(key, targetSessionId);
+
+    // 淘汰内存旧 record：下一条消息将按新 sessionId getOrCreate/resume
+    if (current) {
+      this.sessions.delete(key);
+      current.agent.cancel({ kind: 'user' });
+      await current.handle.dispose().catch(() => {});
+    }
+
+    this.logger.info(`session switched: key=${key} → ${targetSessionId}`);
+    return { ok: true, sessionId: targetSessionId };
   }
 
   async disposeAll(): Promise<void> {

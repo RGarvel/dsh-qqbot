@@ -9,6 +9,7 @@
  */
 import type { CommandDeps, CategorizedCommand } from './types.ts';
 import { newCommand, compactCommand } from './session.ts';
+import { switchCommand } from './switch.ts';
 import { modelCommand } from './model.ts';
 import { presetCommand } from './preset.ts';
 import { statusCommand } from './status.ts';
@@ -23,6 +24,7 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
     // 通用能力（底层 agent）
     newCommand(deps),
     compactCommand(deps),
+    switchCommand(deps),
     modelCommand(deps),
     presetCommand(deps),
     stopCommand(deps),
